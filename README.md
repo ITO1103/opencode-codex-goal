@@ -76,7 +76,7 @@ OpenCodeの型定義はV1 APIの確認用にdev dependencyとして使用しま�
 
 ## Continuation templateのライセンス
 
-`plugin/goalpkg/continuation.template.md` はOpenAI Codex CLIの公開Goal continuation templateを元にした改変物です．元リポジトリは現在Apache License 2.0で公開されており，元ファイルのcopyrightと出典，改変内容をtemplateのprovenance commentと `NOTICE` に記載しています．元ファイルのパスはCodex CLI側の更新で変わる可能性があるため，公開前にリンク先の現行ファイルとライセンスを再確認してください．
+本リポジトリ自身のコードは `LICENSE` のMIT Licenseで公開します．`plugin/goalpkg/continuation.template.md` はOpenAI Codex CLIの公開Goal continuation templateを元にした改変物で，元リポジトリのApache License 2.0が適用されます．元ファイルのcopyrightと出典，改変内容はtemplateのprovenance commentと `NOTICE` に記載し，Apache License 2.0本文を `LICENSE-CODEX-APACHE-2.0` に保存しています．元ファイルのパスはCodex CLI側の更新で変わる可能性があるため，公開前にリンク先の現行ファイルとライセンスを再確認してください．
 
 ## 既知の注意
 

@@ -1,7 +1,9 @@
 opencode-codex-goal
 
+The original code in this repository is distributed under the MIT License.
+
 This project includes an adapted continuation template derived from OpenAI Codex CLI:
 https://github.com/openai/codex/blob/main/codex-rs/prompts/templates/goals/continuation.md
 
 Copyright 2025 OpenAI. The original Codex CLI is licensed under the Apache License, Version 2.0.
-The adapted file is identified in plugin/goalpkg/continuation.template.md.
+The adapted file is identified in plugin/goalpkg/continuation.template.md and is subject to LICENSE-CODEX-APACHE-2.0.
