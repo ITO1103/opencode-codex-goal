@@ -1,0 +1,22 @@
+node_modules/
+.DS_Store
+
+# Per-project Goal state is runtime data, not repository content.
+**/.opencode/goal/
+goal/
+
+# OpenCode may install runtime dependencies beside a project-local plugin.
+.opencode/package.json
+.opencode/package-lock.json
+.opencode/bun.lock
+.opencode/.gitignore
+
+# Temporary files, logs, and debug output.
+*.tmp
+*.log
+*.debug
+*.out
+.cache/
+
+# Legacy working directory from the pre-repository layout.
+/opencode/
