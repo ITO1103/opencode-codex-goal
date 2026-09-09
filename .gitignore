@@ -17,6 +17,3 @@ goal/
 *.debug
 *.out
 .cache/
-
-# Legacy working directory from the pre-repository layout.
-/opencode/
