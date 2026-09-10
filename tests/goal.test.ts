@@ -5,8 +5,13 @@ import { join } from "node:path"
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { GoalPlugin } from "../plugin/goal.ts"
-import { isModelTurnError } from "../plugin/goalpkg/plugin.ts"
-import { GoalStore } from "../plugin/goalpkg/state.ts"
+import { classifyGoalError, isModelTurnError } from "../plugin/goalpkg/plugin.ts"
+import {
+  GoalStore,
+  MAX_CONSECUTIVE_FAILURES,
+  MAX_NO_PROGRESS_FAILURES,
+  RETRY_BASE_DELAY_MS,
+} from "../plugin/goalpkg/state.ts"
 import { parseGoalArgs } from "../plugin/goalpkg/verbs.ts"
 
 const repositoryDir = join(import.meta.dirname, "..")
@@ -26,17 +31,46 @@ test("GoalStore persists state across store instances and writes atomically", ()
   const directory = mkdtempSync(join(tmpdir(), "opencode-goal-state-"))
   const first = new GoalStore(directory)
   first.set("session-a", "finish the task")
-  first.incrementTurn("session-a")
+  first.recordSuccessfulTurn("session-a")
   first.setStatus("session-a", "paused")
 
   const second = new GoalStore(directory)
-  assert.deepEqual(second.get("session-a"), {
+  writeFileSync(
+    join(directory, "legacy.json"),
+    JSON.stringify({
+      sessionID: "legacy",
+      objective: "old state",
+      status: "active",
+      createdAt: 1,
+      updatedAt: 1,
+      turnCount: 4,
+    }),
+  )
+  assert.deepEqual(
+    (({ consecutiveFailures, lastSuccessfulTurn, nextRetryAt }: NonNullable<ReturnType<GoalStore["get"]>>) => ({
+      consecutiveFailures,
+      lastSuccessfulTurn,
+      nextRetryAt,
+    }))(second.get("legacy")!),
+    { consecutiveFailures: 0, lastSuccessfulTurn: 4, nextRetryAt: null },
+  )
+  const restored = second.get("session-a")!
+  assert.deepEqual(restored, {
     sessionID: "session-a",
     objective: "finish the task",
     status: "paused",
-    createdAt: second.get("session-a")?.createdAt,
-    updatedAt: second.get("session-a")?.updatedAt,
+    createdAt: restored.createdAt,
+    updatedAt: restored.updatedAt,
     turnCount: 1,
+    consecutiveFailures: 0,
+    lastErrorKind: null,
+    lastErrorMessage: null,
+    lastErrorAt: null,
+    nextRetryAt: null,
+    lastSuccessfulTurn: 1,
+    lastProgressAt: restored.lastProgressAt,
+    lastProgressKind: "turn.success",
+    waitingForCompaction: false,
   })
   assert.equal(readFileSync(join(directory, "session-a.json"), "utf8").includes("finish the task"), true)
   second.clear("session-a")
@@ -120,6 +154,11 @@ test("Qwen-compatible system handling and model error policy are preserved", asy
   assert.equal(isModelTurnError({ name: "ProviderAuthError" }), false)
   assert.equal(isModelTurnError({ name: "MessageAbortedError" }), false)
   assert.equal(isModelTurnError(new Error("ECONNRESET")), false)
+  assert.equal(classifyGoalError({ name: "APIError", data: { isRetryable: true, message: "upstream" } }), "api_retryable")
+  assert.equal(classifyGoalError({ name: "APIError", data: { isRetryable: false, message: "unauthorized" } }), "api_non_retryable")
+  assert.equal(classifyGoalError({ name: "UnknownError", data: { message: "SSE read timed out" } }), "transport")
+  assert.equal(classifyGoalError({ name: "ContextOverflowError", data: { message: "too large" } }), "context_overflow")
+  assert.equal(classifyGoalError({ name: "MessageAbortedError", data: { message: "aborted" } }), "aborted")
 
   const projectDir = mkdtempSync(join(tmpdir(), "opencode-goal-qwen-"))
   const hooks = await GoalPlugin({
@@ -132,6 +171,212 @@ test("Qwen-compatible system handling and model error policy are preserved", asy
   await hooks["experimental.chat.system.transform"]!({ sessionID: "qwen", model: {} as never }, output)
   assert.equal(output.system.length, 1)
   assert.match(output.system[0], /existing[\s\S]*Continue working toward the active goal\./)
+})
+
+test("transport timeout uses persisted backoff, stops at the failure limit, and resumes cleanly", async () => {
+  const projectDir = mkdtempSync(join(tmpdir(), "opencode-goal-timeout-"))
+  let calls = 0
+  const timeout = { name: "APIError", data: { message: "SSE read timed out", isRetryable: true } }
+  const hooks = await GoalPlugin({
+    directory: projectDir,
+    worktree: projectDir,
+    client: {
+      session: {
+        prompt: async () => {
+          calls += 1
+          if (calls <= MAX_NO_PROGRESS_FAILURES) throw timeout
+          return {}
+        },
+      },
+    },
+  } as never)
+  const before = hooks["command.execute.before"]!
+  const event = hooks.event!
+  const store = new GoalStore(join(projectDir, ".opencode/goal"))
+  const sessionID = "timeout-session"
+  await before({ command: "goal", sessionID, arguments: "slow remote task" }, { parts: [] } as never)
+
+  const startedAt = Date.now()
+  await event({ event: { type: "session.idle", properties: { sessionID } } })
+  let goal = store.get(sessionID)!
+  assert.equal(calls, 1)
+  assert.equal(goal.status, "active")
+  assert.equal(goal.turnCount, 0)
+  assert.equal(goal.consecutiveFailures, 1)
+  assert.equal(goal.lastErrorKind, "transport")
+  assert.equal(goal.lastErrorMessage, "SSE read timed out")
+  assert.ok(goal.nextRetryAt! >= startedAt + RETRY_BASE_DELAY_MS)
+
+  await event({ event: { type: "session.idle", properties: { sessionID } } })
+  assert.equal(calls, 1)
+
+  // Simulate the persisted retry becoming due. This also avoids making the
+  // test wait through the real 1s/2s delays.
+  goal = { ...store.get(sessionID)!, nextRetryAt: Date.now() - 1 }
+  writeFileSync(join(projectDir, ".opencode/goal", `${sessionID}.json`), JSON.stringify(goal))
+  await event({ event: { type: "session.idle", properties: { sessionID } } })
+  goal = store.get(sessionID)!
+  assert.equal(calls, MAX_NO_PROGRESS_FAILURES)
+  assert.equal(goal.status, "waiting")
+  assert.equal(goal.nextRetryAt, null)
+  assert.equal(goal.turnCount, 0)
+
+  await event({ event: { type: "session.idle", properties: { sessionID } } })
+  assert.equal(calls, MAX_NO_PROGRESS_FAILURES)
+  const capped = new GoalStore(join(projectDir, ".opencode/goal"))
+  capped.set("different-errors", "cap retries")
+  capped.recordFailure("different-errors", "transport", "error 1")
+  capped.recordFailure("different-errors", "transport", "error 2")
+  capped.recordFailure("different-errors", "transport", "error 3")
+  assert.equal(capped.get("different-errors")?.status, "waiting")
+  assert.equal(capped.get("different-errors")?.consecutiveFailures, MAX_CONSECUTIVE_FAILURES)
+  await before({ command: "goal", sessionID, arguments: "resume" }, { parts: [] } as never)
+  goal = store.get(sessionID)!
+  assert.equal(goal.status, "active")
+  assert.equal(goal.consecutiveFailures, 0)
+  assert.equal(goal.nextRetryAt, null)
+  await event({ event: { type: "session.idle", properties: { sessionID } } })
+  assert.equal(calls, 3)
+  assert.equal(store.get(sessionID)!.turnCount, 1)
+  await hooks.dispose?.()
+})
+
+test("in-flight, busy, and compaction states suppress duplicate continuations", async () => {
+  const projectDir = mkdtempSync(join(tmpdir(), "opencode-goal-flight-"))
+  const prompts: unknown[] = []
+  let release!: (value: unknown) => void
+  const hooks = await GoalPlugin({
+    directory: projectDir,
+    worktree: projectDir,
+    client: {
+      session: {
+        prompt: async (value: unknown) => {
+          prompts.push(value)
+          if (prompts.length > 1) return {}
+          return new Promise((resolve) => {
+            release = resolve
+          })
+        },
+      },
+    },
+  } as never)
+  const before = hooks["command.execute.before"]!
+  const event = hooks.event!
+  await before({ command: "goal", sessionID: "flight", arguments: "avoid duplicates" }, { parts: [] } as never)
+
+  const first = event({ event: { type: "session.idle", properties: { sessionID: "flight" } } })
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  await event({ event: { type: "session.idle", properties: { sessionID: "flight" } } })
+  assert.equal(prompts.length, 1)
+  release({})
+  await first
+  assert.equal(new GoalStore(join(projectDir, ".opencode/goal")).get("flight")?.turnCount, 1)
+
+  await before({ command: "goal", sessionID: "busy", arguments: "wait for busy session" }, { parts: [] } as never)
+  await event({ event: { type: "session.status", properties: { sessionID: "busy", status: { type: "busy" } } } })
+  await event({ event: { type: "session.idle", properties: { sessionID: "busy" } } })
+  assert.equal(prompts.length, 1)
+
+  await before({ command: "goal", sessionID: "retry", arguments: "wait for provider retry" }, { parts: [] } as never)
+  await event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "retry", status: { type: "retry", attempt: 1, message: "provider retry", next: Date.now() + 1_000 } },
+    },
+  })
+  await event({ event: { type: "session.idle", properties: { sessionID: "retry" } } })
+  assert.equal(prompts.length, 1)
+
+  await before({ command: "goal", sessionID: "compaction", arguments: "wait for compaction" }, { parts: [] } as never)
+  await hooks["experimental.session.compacting"]!({ sessionID: "compaction" }, { context: [] })
+  await event({ event: { type: "session.idle", properties: { sessionID: "compaction" } } })
+  assert.equal(prompts.length, 1)
+  await event({ event: { type: "session.compacted", properties: { sessionID: "compaction" } } })
+  await event({ event: { type: "session.idle", properties: { sessionID: "compaction" } } })
+  assert.equal(prompts.length, 2)
+  await hooks.dispose?.()
+})
+
+test("context overflow waits for compaction and progress is persisted", async () => {
+  const projectDir = mkdtempSync(join(tmpdir(), "opencode-goal-progress-"))
+  let calls = 0
+  const hooks = await GoalPlugin({
+    directory: projectDir,
+    worktree: projectDir,
+    client: {
+      session: {
+        prompt: async () => {
+          calls += 1
+          if (calls === 1) throw { name: "ContextOverflowError", data: { message: "context window exceeded" } }
+          return {}
+        },
+      },
+    },
+  } as never)
+  const before = hooks["command.execute.before"]!
+  const event = hooks.event!
+  const store = new GoalStore(join(projectDir, ".opencode/goal"))
+  await before({ command: "goal", sessionID: "context", arguments: "compact safely" }, { parts: [] } as never)
+  await event({ event: { type: "session.idle", properties: { sessionID: "context" } } })
+  const contextGoal = store.get("context")!
+  assert.deepEqual(
+    (({ status, waitingForCompaction, nextRetryAt, turnCount }) => ({
+      status,
+      waitingForCompaction,
+      nextRetryAt,
+      turnCount,
+    }))(contextGoal),
+    { status: "waiting", waitingForCompaction: true, nextRetryAt: null, turnCount: 0 },
+  )
+  await event({ event: { type: "session.idle", properties: { sessionID: "context" } } })
+  assert.equal(calls, 1)
+  await event({ event: { type: "session.compacted", properties: { sessionID: "context" } } })
+  assert.equal(store.get("context")?.status, "active")
+  await event({ event: { type: "session.idle", properties: { sessionID: "context" } } })
+  assert.equal(calls, 2)
+  assert.equal(store.get("context")?.turnCount, 1)
+
+  const checkpoint = hooks.tool!.goal_checkpoint
+  await checkpoint.execute({ summary: "verified checkpoint" }, { sessionID: "context" } as never)
+  assert.equal(store.get("context")?.lastProgressKind, "goal_checkpoint")
+  await hooks["tool.execute.after"]!({ sessionID: "context", tool: "shell" } as never, {} as never)
+  assert.equal(store.get("context")?.lastProgressKind, "tool:shell")
+  await event({ event: { type: "file.edited", properties: { file: "README.md" } } })
+  assert.equal(store.get("context")?.lastProgressKind, "file.edited")
+  await hooks.dispose?.()
+})
+
+test("nextRetryAt survives a plugin restart", async () => {
+  const projectDir = mkdtempSync(join(tmpdir(), "opencode-goal-restart-"))
+  const timeout = new Error("ECONNRESET")
+  const firstHooks = await GoalPlugin({
+    directory: projectDir,
+    worktree: projectDir,
+    client: { session: { prompt: async () => { throw timeout } } },
+  } as never)
+  const before = firstHooks["command.execute.before"]!
+  const event = firstHooks.event!
+  const sessionID = "restart"
+  await before({ command: "goal", sessionID, arguments: "persist retry" }, { parts: [] } as never)
+  await event({ event: { type: "session.idle", properties: { sessionID } } })
+  const store = new GoalStore(join(projectDir, ".opencode/goal"))
+  assert.ok(store.get(sessionID)!.nextRetryAt! > Date.now())
+  await firstHooks.dispose?.()
+
+  let restartedCalls = 0
+  const secondHooks = await GoalPlugin({
+    directory: projectDir,
+    worktree: projectDir,
+    client: { session: { prompt: async () => { restartedCalls += 1; return {} } } },
+  } as never)
+  await secondHooks.event!({ event: { type: "session.idle", properties: { sessionID } } })
+  assert.equal(restartedCalls, 0)
+  const due = { ...store.get(sessionID)!, nextRetryAt: Date.now() - 1 }
+  writeFileSync(join(projectDir, ".opencode/goal", `${sessionID}.json`), JSON.stringify(due))
+  await secondHooks.event!({ event: { type: "session.idle", properties: { sessionID } } })
+  assert.equal(restartedCalls, 1)
+  assert.equal(store.get(sessionID)!.turnCount, 1)
+  await secondHooks.dispose?.()
 })
 
 test("install and uninstall are idempotent and never overwrite unrelated files", () => {

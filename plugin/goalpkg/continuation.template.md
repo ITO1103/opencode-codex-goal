@@ -6,7 +6,7 @@ Copyright 2025 OpenAI. The original project is licensed under Apache License 2.0
 Adaptations for OpenCode 1.x:
 - The token-budget section is omitted because this plugin is uncapped.
 - OpenCode's todo/plan tool replaces Codex's update_plan tool.
-- goal_complete and goal_blocked replace Codex's update_goal calls.
+- goal_checkpoint records verified intermediate progress; goal_complete and goal_blocked replace Codex's update_goal calls.
 - The objective placeholder is XML-escaped before injection.
 -->
 Continue working toward the active goal.
@@ -27,6 +27,7 @@ Use the current worktree and external state as authoritative. Previous conversat
 
 Progress visibility:
 If a todo/plan tool is available and the next work is meaningfully multi-step, use it to show a concise plan tied to the real objective. Keep the plan current as steps complete or the next best action changes. Skip planning overhead for trivial one-step progress, and do not treat a plan update as a substitute for doing the work.
+When a meaningful intermediate milestone is actually verified, use the `goal_checkpoint` tool with a concise description. Do not use checkpoints as a substitute for doing the work or for the final completion audit.
 
 Fidelity:
 - Optimize each turn for movement toward the requested end state, not for the smallest stable-looking subset or easiest passing change.
