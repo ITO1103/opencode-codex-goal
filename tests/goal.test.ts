@@ -5,7 +5,7 @@ import { join } from "node:path"
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { GoalPlugin } from "../plugin/goal.ts"
-import { classifyGoalError, isModelTurnError } from "../plugin/goalpkg/plugin.ts"
+import { classifyGoalError, isModelTurnError, MAX_IDENTICAL_TOOL_CALLS } from "../plugin/goalpkg/plugin.ts"
 import {
   GoalStore,
   MAX_CONSECUTIVE_FAILURES,
@@ -171,6 +171,60 @@ test("Qwen-compatible system handling and model error policy are preserved", asy
   await hooks["experimental.chat.system.transform"]!({ sessionID: "qwen", model: {} as never }, output)
   assert.equal(output.system.length, 1)
   assert.match(output.system[0], /existing[\s\S]*Continue working toward the active goal\./)
+})
+
+test("identical tool calls stop the goal and abort the active session", async () => {
+  const projectDir = mkdtempSync(join(tmpdir(), "opencode-goal-no-progress-"))
+  const aborts: unknown[] = []
+  const hooks = await GoalPlugin({
+    directory: projectDir,
+    worktree: projectDir,
+    client: {
+      session: {
+        prompt: async () => ({}),
+        abort: async (value: unknown) => {
+          aborts.push(value)
+          return {}
+        },
+      },
+    },
+  } as never)
+  const before = hooks["command.execute.before"]!
+  const after = hooks["tool.execute.after"]!
+  const store = new GoalStore(join(projectDir, ".opencode/goal"))
+  const sessionID = "no-progress"
+  const args = { content: "same content", path: "/work/src/container/cpk_reader.h" }
+
+  await before({ command: "goal", sessionID, arguments: "make progress" }, { parts: [] } as never)
+  for (let count = 1; count <= MAX_IDENTICAL_TOOL_CALLS; count += 1) {
+    await after(
+      { sessionID, tool: "acah_re_acah_re_write", callID: `call-${count}`, args },
+      { title: "write", output: "wrote 12 characters", metadata: {} },
+    )
+    if (count < MAX_IDENTICAL_TOOL_CALLS) assert.equal(store.get(sessionID)?.status, "active")
+  }
+
+  let goal = store.get(sessionID)!
+  assert.equal(goal.status, "waiting")
+  assert.equal(goal.lastErrorKind, "no_progress")
+  assert.match(goal.lastErrorMessage ?? "", /Identical tool call repeated 3 times/)
+  assert.deepEqual(aborts, [{ path: { id: sessionID } }])
+
+  await after(
+    { sessionID, tool: "acah_re_acah_re_write", callID: "call-4", args },
+    { title: "write", output: "wrote 12 characters", metadata: {} },
+  )
+  assert.equal(aborts.length, 1)
+
+  await before({ command: "goal", sessionID, arguments: "resume" }, { parts: [] } as never)
+  await after(
+    { sessionID, tool: "acah_re_acah_re_write", callID: "call-resumed", args },
+    { title: "write", output: "wrote 12 characters", metadata: {} },
+  )
+  goal = store.get(sessionID)!
+  assert.equal(goal.status, "active")
+  assert.equal(aborts.length, 1)
+  await hooks.dispose?.()
 })
 
 test("transport timeout uses persisted backoff, stops at the failure limit, and resumes cleanly", async () => {

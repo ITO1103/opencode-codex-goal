@@ -11,6 +11,7 @@ export type GoalErrorKind =
   | "context_overflow"
   | "aborted"
   | "model_turn"
+  | "no_progress"
   | "unknown"
 
 export const MAX_CONSECUTIVE_FAILURES = 3

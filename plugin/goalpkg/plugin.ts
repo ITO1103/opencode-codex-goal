@@ -15,6 +15,25 @@ const TRANSPORT_MSG_RE =
 const CONTEXT_MSG_RE =
   /context.{0,30}(overflow|length|window|limit)|too many tokens|maximum context|prompt.{0,20}(too long|token)|token.{0,20}(limit|exceed)|exceed.{0,20}(context|token)/i
 
+export const MAX_IDENTICAL_TOOL_CALLS = 3
+
+function stableSerialize(value: unknown): string {
+  if (value === null) return "null"
+  if (Array.isArray(value)) return `[${value.map(stableSerialize).join(",")}]`
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableSerialize(record[key])}`)
+      .join(",")}}`
+  }
+  return JSON.stringify(value) ?? String(value)
+}
+
+function toolCallSignature(tool: string, args: unknown): string {
+  return `${tool}:${stableSerialize(args)}`
+}
+
 function resolveStateDir(input: PluginInput): string {
   return join(input.directory || input.worktree || process.cwd(), ".opencode", "goal")
 }
@@ -113,6 +132,7 @@ function viewText(goal: Goal | undefined): string {
 type RuntimeSessionStatus = "idle" | "retry" | "busy"
 type ContinuationAttempt = { handled: boolean; idleObserved: boolean }
 type RetryTimer = ReturnType<typeof setTimeout>
+type RepeatedToolCall = { signature: string; count: number }
 
 export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
   const store = new GoalStore(resolveStateDir(input))
@@ -122,6 +142,7 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
   const inFlight = new Map<string, ContinuationAttempt>()
   const retryTimers = new Map<string, RetryTimer>()
   const recentErrors = new Map<string, { kind: GoalErrorKind; message: string; at: number }>()
+  const repeatedToolCalls = new Map<string, RepeatedToolCall>()
 
   function clearRetryTimer(sessionID: string): void {
     const timer = retryTimers.get(sessionID)
@@ -133,6 +154,40 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
   function invalidateAttempt(sessionID: string): void {
     const attempt = inFlight.get(sessionID)
     if (attempt) attempt.handled = true
+  }
+
+  function resetRepeatedToolCall(sessionID: string): void {
+    repeatedToolCalls.delete(sessionID)
+  }
+
+  function observeToolCall(sessionID: string, tool: string, args: unknown): number {
+    const signature = toolCallSignature(tool, args)
+    const previous = repeatedToolCalls.get(sessionID)
+    const count = previous?.signature === signature ? previous.count + 1 : 1
+    repeatedToolCalls.set(sessionID, { signature, count })
+    return count
+  }
+
+  async function abortSession(sessionID: string): Promise<void> {
+    if (typeof client.session.abort !== "function") return
+    try {
+      await client.session.abort({ path: { id: sessionID } })
+    } catch {
+      // The state transition remains authoritative if the prompt already ended.
+    }
+  }
+
+  async function stopForNoProgress(sessionID: string, tool: string, count: number): Promise<void> {
+    invalidateAttempt(sessionID)
+    const updated = store.recordFailure(
+      sessionID,
+      "no_progress",
+      `Identical tool call repeated ${count} times: ${tool}`,
+      false,
+    )
+    if (!updated || updated.status !== "waiting") return
+    clearRetryTimer(sessionID)
+    await abortSession(sessionID)
   }
 
   function scheduleRetry(sessionID: string, nextRetryAt: number): void {
@@ -236,6 +291,7 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
         case "set":
           invalidateAttempt(sessionID)
           clearRetryTimer(sessionID)
+          resetRepeatedToolCall(sessionID)
           store.set(sessionID, action.objective)
           setParts(output, CONTINUE_NUDGE)
           return
@@ -246,6 +302,7 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
           }
           invalidateAttempt(sessionID)
           clearRetryTimer(sessionID)
+          resetRepeatedToolCall(sessionID)
           store.setStatus(sessionID, "paused")
           setParts(
             output,
@@ -261,6 +318,7 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
           const wasComplete = existing.status === "complete"
           invalidateAttempt(sessionID)
           clearRetryTimer(sessionID)
+          resetRepeatedToolCall(sessionID)
           store.resume(sessionID)
           setParts(
             output,
@@ -277,6 +335,7 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
           }
           invalidateAttempt(sessionID)
           clearRetryTimer(sessionID)
+          resetRepeatedToolCall(sessionID)
           store.clear(sessionID)
           setParts(output, "[goal] cleared.")
           return
@@ -335,14 +394,6 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
           return
         }
 
-        if (event.type === "message.part.updated") {
-          const part = event.properties.part
-          if (part.type === "tool" && part.state.status === "completed") {
-            store.recordProgress(part.sessionID, `tool:${part.tool}`)
-          }
-          return
-        }
-
         if (event.type === "file.edited") {
           const sessionID = (event.properties as { sessionID?: unknown }).sessionID
           const sessionIDs =
@@ -361,6 +412,20 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
 
     "tool.execute.after": async (toolInput) => {
       try {
+        if (toolInput.tool === "goal_checkpoint") {
+          resetRepeatedToolCall(toolInput.sessionID)
+          return
+        }
+
+        const goal = store.get(toolInput.sessionID)
+        if (!goal || goal.status !== "active") return
+
+        const count = observeToolCall(toolInput.sessionID, toolInput.tool, toolInput.args)
+        if (count >= MAX_IDENTICAL_TOOL_CALLS) {
+          await stopForNoProgress(toolInput.sessionID, toolInput.tool, count)
+          return
+        }
+
         store.recordProgress(toolInput.sessionID, `tool:${toolInput.tool}`)
       } catch {
         // Progress telemetry must not break tool execution.
