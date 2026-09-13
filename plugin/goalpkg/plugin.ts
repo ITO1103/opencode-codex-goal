@@ -111,7 +111,7 @@ function viewText(goal: Goal | undefined): string {
 }
 
 type RuntimeSessionStatus = "idle" | "retry" | "busy"
-type ContinuationAttempt = { handled: boolean }
+type ContinuationAttempt = { handled: boolean; idleObserved: boolean }
 type RetryTimer = ReturnType<typeof setTimeout>
 
 export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
@@ -157,7 +157,7 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
     if (!attempt && recent && recent.kind === kind && recent.message === message && now - recent.at < 500) return
     recentErrors.set(sessionID, { kind, message, at: now })
 
-    const retryable = kind === "transport" || kind === "api_retryable"
+    const retryable = kind === "transport" || kind === "api_retryable" || kind === "aborted"
     const updated = store.recordFailure(sessionID, kind, message, retryable)
     if (!updated || updated.status !== "active" || updated.nextRetryAt === null) {
       clearRetryTimer(sessionID)
@@ -180,7 +180,8 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
       return
     }
 
-    const attempt: ContinuationAttempt = { handled: false }
+    const attempt: ContinuationAttempt = { handled: false, idleObserved: false }
+    let continueAfterSuccess = false
     inFlight.set(sessionID, attempt)
     try {
       let response: Awaited<ReturnType<typeof client.session.prompt>>
@@ -202,14 +203,21 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
       if (responseError) {
         handleError(sessionID, responseError, attempt)
       } else {
-        store.recordSuccessfulTurn(sessionID)
+        const updated = store.recordSuccessfulTurn(sessionID)
         clearRetryTimer(sessionID)
+        continueAfterSuccess =
+          attempt.idleObserved &&
+          updated?.status === "active" &&
+          updated.nextRetryAt === null &&
+          !updated.waitingForCompaction
       }
     } catch {
       // A storage or lifecycle error must not break the host event loop.
     } finally {
       inFlight.delete(sessionID)
     }
+
+    if (continueAfterSuccess) queueMicrotask(() => void runContinuation(sessionID))
   }
 
   return {
@@ -304,6 +312,11 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
         }
 
         if (event.type === "session.idle") {
+          const attempt = inFlight.get(event.properties.sessionID)
+          if (attempt) {
+            attempt.idleObserved = true
+            return
+          }
           await runContinuation(event.properties.sessionID)
           return
         }

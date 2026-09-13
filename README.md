@@ -9,7 +9,7 @@ OpenCode 1.x向けの，OpenAI Codex CLIのGoal continuationの考え方を移�
 - OpenCode 1.xのV1 Plugin API向けです．OpenCode 2向けのAPIへ移行していません．
 - `/goal`，`/goal pause`，`/goal resume`，`/goal clear`を提供します．
 - Goal stateは現在のプロジェクトの `.opencode/goal/<sessionID>.json` に保存されます．global pluginとして導入しても，clone先の `~/.config/opencode/opencode-codex-goal/goal/` には保存されません．
-- 成功した継続turn数に固定上限はありません．Goalが `complete`，`blocked`，`paused`，`waiting`，`cleared` になるまで継続します．transport/API障害の失敗retryだけはbackoffと連続失敗上限で停止します．
+- 成功した継続turn数に固定上限はありません．Goalが `complete`，`blocked`，`paused`，`waiting`，`cleared` になるまで継続します．transport/API/abort障害の失敗retryだけはbackoffと連続失敗上限で停止します．
 - `goal_checkpoint`，`goal_complete`，`goal_blocked` はモデル側に提供され，pause/resume/clearはユーザーの `/goal` 操作です．
 - objectiveとcompletion/blocked auditはsystem promptへ注入します．Qwen系などsingle-system-messageを要求するモデルでは，既存の先頭system messageへmergeします．
 - `/goal` commandの実行時は内部のcontinuation templateを画面へ展開せず，簡潔な表示だけを返します．
@@ -62,7 +62,7 @@ symlinkはclone先を指しているため，OpenCodeを再起動すれば更新
 
 Goalを設定するとactive stateがsession IDごとに保存されます．通常のturnがidleになると，Pluginは同じsessionへ短いcontinuation messageを送り，system promptにはobjectiveとaudit templateを再注入します．同じsessionでpromptがin-flightの間，sessionがbusy/retryの間，またはcompaction中は重複したpromptを送信しません．モデルが実際の状態を確認して全要件を満たしたと判断したとき `goal_complete` を呼び，厳密なblocked auditを満たしてユーザー入力などなしには進められないとき `goal_blocked` を呼びます．意味のある中間成果は `goal_checkpoint` で記録できます．
 
-自動継続の成功turn数はuncappedです．一方，SSE read timeout，ECONNRESETなどのretryable transport errorは指数backoffで通常最大3回の連続失敗まで再試行し，超過すると `waiting` へ移ります．同じエラーが進捗なしで続く場合は2回で早期停止します．認証エラー，非retryable API error，abort，未知の障害も安全のため `waiting` に移します．context overflowはcompaction完了まで `waiting` に保持します．`waiting` からは `/goal resume` でretryカウンタと待機状態をリセットして再開できます．`blocked` はgoal自体の外部入力待ち，`paused` はユーザー停止，`waiting` はLLM/API障害による自動停止です．
+自動継続の成功turn数はuncappedです．一方，SSE read timeout，ECONNRESET，abortなどのretryable errorは指数backoffで通常最大3回の連続失敗まで再試行し，超過すると `waiting` へ移ります．同じエラーが進捗なしで続く場合は2回で早期停止します．認証エラー，非retryable API error，未知の障害は `waiting` に移します．context overflowはcompaction完了まで `waiting` に保持します．明示的に停止する場合は `/goal pause` または `/goal clear` を使用してください．`waiting` からは `/goal resume` でretryカウンタと待機状態をリセットして再開できます．`blocked` はgoal自体の外部入力待ち，`paused` はユーザー停止，`waiting` はLLM/API障害による自動停止です．
 
 ## 開発と確認
 

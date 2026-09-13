@@ -270,12 +270,14 @@ test("in-flight, busy, and compaction states suppress duplicate continuations", 
   assert.equal(prompts.length, 1)
   release({})
   await first
-  assert.equal(new GoalStore(join(projectDir, ".opencode/goal")).get("flight")?.turnCount, 1)
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  assert.equal(prompts.length, 2)
+  assert.equal(new GoalStore(join(projectDir, ".opencode/goal")).get("flight")?.turnCount, 2)
 
   await before({ command: "goal", sessionID: "busy", arguments: "wait for busy session" }, { parts: [] } as never)
   await event({ event: { type: "session.status", properties: { sessionID: "busy", status: { type: "busy" } } } })
   await event({ event: { type: "session.idle", properties: { sessionID: "busy" } } })
-  assert.equal(prompts.length, 1)
+  assert.equal(prompts.length, 2)
 
   await before({ command: "goal", sessionID: "retry", arguments: "wait for provider retry" }, { parts: [] } as never)
   await event({
@@ -285,15 +287,62 @@ test("in-flight, busy, and compaction states suppress duplicate continuations", 
     },
   })
   await event({ event: { type: "session.idle", properties: { sessionID: "retry" } } })
-  assert.equal(prompts.length, 1)
+  assert.equal(prompts.length, 2)
 
   await before({ command: "goal", sessionID: "compaction", arguments: "wait for compaction" }, { parts: [] } as never)
   await hooks["experimental.session.compacting"]!({ sessionID: "compaction" }, { context: [] })
   await event({ event: { type: "session.idle", properties: { sessionID: "compaction" } } })
-  assert.equal(prompts.length, 1)
+  assert.equal(prompts.length, 2)
   await event({ event: { type: "session.compacted", properties: { sessionID: "compaction" } } })
   await event({ event: { type: "session.idle", properties: { sessionID: "compaction" } } })
-  assert.equal(prompts.length, 2)
+  assert.equal(prompts.length, 3)
+  await hooks.dispose?.()
+})
+
+test("aborted continuation uses bounded retry and can be resumed", async () => {
+  const projectDir = mkdtempSync(join(tmpdir(), "opencode-goal-aborted-"))
+  let calls = 0
+  const aborted = { name: "MessageAbortedError", data: { message: "Aborted" } }
+  const hooks = await GoalPlugin({
+    directory: projectDir,
+    worktree: projectDir,
+    client: {
+      session: {
+        prompt: async () => {
+          calls += 1
+          throw aborted
+        },
+      },
+    },
+  } as never)
+  const before = hooks["command.execute.before"]!
+  const event = hooks.event!
+  const store = new GoalStore(join(projectDir, ".opencode/goal"))
+  const sessionID = "aborted-session"
+  await before({ command: "goal", sessionID, arguments: "recover from a transient abort" }, { parts: [] } as never)
+
+  await event({ event: { type: "session.idle", properties: { sessionID } } })
+  let goal = store.get(sessionID)!
+  assert.equal(calls, 1)
+  assert.equal(goal.status, "active")
+  assert.equal(goal.lastErrorKind, "aborted")
+  assert.ok(goal.nextRetryAt! >= Date.now())
+
+  goal = { ...goal, nextRetryAt: Date.now() - 1 }
+  writeFileSync(join(projectDir, ".opencode/goal", `${sessionID}.json`), JSON.stringify(goal))
+  await event({ event: { type: "session.idle", properties: { sessionID } } })
+  goal = store.get(sessionID)!
+  assert.equal(calls, 2)
+  assert.equal(goal.status, "waiting")
+  assert.equal(goal.nextRetryAt, null)
+
+  await before({ command: "goal", sessionID, arguments: "resume" }, { parts: [] } as never)
+  await event({ event: { type: "session.idle", properties: { sessionID } } })
+  goal = store.get(sessionID)!
+  assert.equal(calls, 3)
+  assert.equal(goal.status, "active")
+  assert.equal(goal.lastErrorKind, "aborted")
+  assert.ok(goal.nextRetryAt! >= Date.now())
   await hooks.dispose?.()
 })
 
