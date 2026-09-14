@@ -6,12 +6,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { GoalPlugin } from "../plugin/goal.ts"
 import { classifyGoalError, isModelTurnError, MAX_IDENTICAL_TOOL_CALLS } from "../plugin/goalpkg/plugin.ts"
-import {
-  GoalStore,
-  MAX_CONSECUTIVE_FAILURES,
-  MAX_NO_PROGRESS_FAILURES,
-  RETRY_BASE_DELAY_MS,
-} from "../plugin/goalpkg/state.ts"
+import { GoalStore, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS } from "../plugin/goalpkg/state.ts"
 import { parseGoalArgs } from "../plugin/goalpkg/verbs.ts"
 
 const repositoryDir = join(import.meta.dirname, "..")
@@ -142,7 +137,20 @@ test("GoalPlugin preserves command UX, project-local state, continuation, and te
   const errorID = "session-error"
   await before({ command: "goal", sessionID: errorID, arguments: "error handling" }, { parts: [] } as never)
   await event({ event: { type: "session.error", properties: { sessionID: errorID, error: { name: "UnknownError" } as never } } })
-  assert.equal(new GoalStore(join(projectDir, ".opencode/goal")).get(errorID)?.status, "blocked")
+  const recoverableError = new GoalStore(join(projectDir, ".opencode/goal")).get(errorID)!
+  assert.equal(recoverableError.status, "active")
+  assert.equal(recoverableError.lastErrorKind, "model_turn")
+  assert.ok(recoverableError.nextRetryAt! >= Date.now())
+
+  const authID = "session-auth"
+  await before({ command: "goal", sessionID: authID, arguments: "requires valid credentials" }, { parts: [] } as never)
+  await event({
+    event: {
+      type: "session.error",
+      properties: { sessionID: authID, error: { name: "ProviderAuthError", data: { message: "unauthorized" } } as never },
+    },
+  })
+  assert.equal(new GoalStore(join(projectDir, ".opencode/goal")).get(authID)?.status, "waiting")
 
   await before({ command: "goal", sessionID: "session-a", arguments: "" }, { parts: [] } as never)
   assert.match((new GoalStore(join(projectDir, ".opencode/goal")).get("session-a")?.objective ?? ""), /inspect/)
@@ -173,7 +181,7 @@ test("Qwen-compatible system handling and model error policy are preserved", asy
   assert.match(output.system[0], /existing[\s\S]*Continue working toward the active goal\./)
 })
 
-test("identical tool calls trigger recovery and eventually stop", async () => {
+test("identical tool calls recover without requiring another idle event or stopping the goal", async () => {
   const projectDir = mkdtempSync(join(tmpdir(), "opencode-goal-no-progress-"))
   const aborts: unknown[] = []
   const prompts: unknown[] = []
@@ -195,7 +203,6 @@ test("identical tool calls trigger recovery and eventually stop", async () => {
   } as never)
   const before = hooks["command.execute.before"]!
   const beforeTool = hooks["tool.execute.before"]!
-  const event = hooks.event!
   const after = hooks["tool.execute.after"]!
   const store = new GoalStore(join(projectDir, ".opencode/goal"))
   const sessionID = "no-progress"
@@ -212,14 +219,14 @@ test("identical tool calls trigger recovery and eventually stop", async () => {
 
   let goal = store.get(sessionID)!
   assert.equal(goal.status, "active")
-  assert.equal(goal.lastErrorKind, "no_progress")
-  assert.match(goal.lastErrorMessage ?? "", /Identical tool call repeated 3 times/)
   assert.deepEqual(aborts, [{ path: { id: sessionID } }])
 
-  await event({ event: { type: "session.idle", properties: { sessionID } } })
+  await new Promise<void>((resolve) => setImmediate(resolve))
   assert.equal(prompts.length, 1)
-  assert.match(((prompts[0] as { body?: { parts?: Array<{ text?: string }> } }).body?.parts?.[0]?.text ?? ""), /goal recovery 1\/1/)
-  assert.equal(store.get(sessionID)?.status, "active")
+  assert.match(((prompts[0] as { body?: { parts?: Array<{ text?: string }> } }).body?.parts?.[0]?.text ?? ""), /goal recovery 1/)
+  goal = store.get(sessionID)!
+  assert.equal(goal.status, "active")
+  assert.equal(goal.lastErrorKind, null)
 
   await assert.rejects(
     () => beforeTool({ sessionID, tool: "acah_re_acah_re_write", callID: "blocked-1" }, { args } as never),
@@ -231,9 +238,81 @@ test("identical tool calls trigger recovery and eventually stop", async () => {
       new RegExp(`Recovery required: refusing identical tool call ${count}/${MAX_IDENTICAL_TOOL_CALLS}`),
     )
   }
+  await new Promise<void>((resolve) => setImmediate(resolve))
   goal = store.get(sessionID)!
-  assert.equal(goal.status, "waiting")
+  assert.equal(goal.status, "active")
   assert.equal(aborts.length, 2)
+  assert.equal(prompts.length, 2)
+  assert.match(((prompts[1] as { body?: { parts?: Array<{ text?: string }> } }).body?.parts?.[0]?.text ?? ""), /goal recovery 2/)
+  await hooks.dispose?.()
+})
+
+test("plugin-issued recovery abort is not counted as a continuation failure", async () => {
+  const projectDir = mkdtempSync(join(tmpdir(), "opencode-goal-self-abort-"))
+  const prompts: unknown[] = []
+  let hooks: Awaited<ReturnType<typeof GoalPlugin>>
+  hooks = await GoalPlugin({
+    directory: projectDir,
+    worktree: projectDir,
+    client: {
+      session: {
+        prompt: async (value: unknown) => {
+          prompts.push(value)
+          return {}
+        },
+        abort: async () => {
+          queueMicrotask(() =>
+            void hooks.event!({
+              event: {
+                type: "session.error",
+                properties: { sessionID: "self-abort", error: { name: "MessageAbortedError", data: { message: "Aborted" } } as never },
+              },
+            }),
+          )
+          queueMicrotask(() =>
+            void hooks.event!({ event: { type: "session.status", properties: { sessionID: "self-abort", status: { type: "idle" } } } }),
+          )
+          queueMicrotask(() => void hooks.event!({ event: { type: "session.idle", properties: { sessionID: "self-abort" } } }))
+          return {}
+        },
+      },
+    },
+  } as never)
+  await hooks["command.execute.before"]!({ command: "goal", sessionID: "self-abort", arguments: "recover" }, { parts: [] } as never)
+  const args = { path: "/tmp/result", content: "same" }
+  for (let count = 1; count <= MAX_IDENTICAL_TOOL_CALLS; count += 1) {
+    await hooks["tool.execute.after"]!(
+      { sessionID: "self-abort", tool: "write", callID: String(count), args },
+      { title: "write", output: "unchanged", metadata: {} },
+    )
+  }
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  const goal = new GoalStore(join(projectDir, ".opencode/goal")).get("self-abort")!
+  assert.equal(prompts.length, 1)
+  assert.equal(goal.status, "active")
+  assert.equal(goal.lastErrorKind, null)
+  assert.equal(goal.consecutiveFailures, 0)
+  await hooks.dispose?.()
+})
+
+test("same polling call with changing output is progress, not a loop", async () => {
+  const projectDir = mkdtempSync(join(tmpdir(), "opencode-goal-polling-"))
+  const aborts: unknown[] = []
+  const hooks = await GoalPlugin({
+    directory: projectDir,
+    worktree: projectDir,
+    client: { session: { prompt: async () => ({}), abort: async (value: unknown) => { aborts.push(value); return {} } } },
+  } as never)
+  const sessionID = "polling"
+  await hooks["command.execute.before"]!({ command: "goal", sessionID, arguments: "wait for the build" }, { parts: [] } as never)
+  for (let count = 1; count <= 5; count += 1) {
+    await hooks["tool.execute.after"]!(
+      { sessionID, tool: "build_status", callID: String(count), args: { job: "42" } },
+      { title: "status", output: `step ${count}/5`, metadata: {} },
+    )
+  }
+  assert.equal(aborts.length, 0)
+  assert.equal(new GoalStore(join(projectDir, ".opencode/goal")).get(sessionID)?.status, "active")
   await hooks.dispose?.()
 })
 
@@ -271,7 +350,7 @@ test("a successful alternate tool call clears the recovery guard", async () => {
   await hooks.dispose?.()
 })
 
-test("transport timeout uses persisted backoff, stops at the failure limit, and resumes cleanly", async () => {
+test("transport timeout uses persisted capped backoff until it eventually succeeds", async () => {
   const projectDir = mkdtempSync(join(tmpdir(), "opencode-goal-timeout-"))
   let calls = 0
   const timeout = { name: "APIError", data: { message: "SSE read timed out", isRetryable: true } }
@@ -282,7 +361,7 @@ test("transport timeout uses persisted backoff, stops at the failure limit, and 
       session: {
         prompt: async () => {
           calls += 1
-          if (calls <= MAX_NO_PROGRESS_FAILURES) throw timeout
+          if (calls <= 8) throw timeout
           return {}
         },
       },
@@ -308,33 +387,22 @@ test("transport timeout uses persisted backoff, stops at the failure limit, and 
   await event({ event: { type: "session.idle", properties: { sessionID } } })
   assert.equal(calls, 1)
 
-  // Simulate the persisted retry becoming due. This also avoids making the
-  // test wait through the real 1s/2s delays.
-  goal = { ...store.get(sessionID)!, nextRetryAt: Date.now() - 1 }
-  writeFileSync(join(projectDir, ".opencode/goal", `${sessionID}.json`), JSON.stringify(goal))
-  await event({ event: { type: "session.idle", properties: { sessionID } } })
-  goal = store.get(sessionID)!
-  assert.equal(calls, MAX_NO_PROGRESS_FAILURES)
-  assert.equal(goal.status, "waiting")
-  assert.equal(goal.nextRetryAt, null)
-  assert.equal(goal.turnCount, 0)
-
-  await event({ event: { type: "session.idle", properties: { sessionID } } })
-  assert.equal(calls, MAX_NO_PROGRESS_FAILURES)
-  const capped = new GoalStore(join(projectDir, ".opencode/goal"))
-  capped.set("different-errors", "cap retries")
-  capped.recordFailure("different-errors", "transport", "error 1")
-  capped.recordFailure("different-errors", "transport", "error 2")
-  capped.recordFailure("different-errors", "transport", "error 3")
-  assert.equal(capped.get("different-errors")?.status, "waiting")
-  assert.equal(capped.get("different-errors")?.consecutiveFailures, MAX_CONSECUTIVE_FAILURES)
-  await before({ command: "goal", sessionID, arguments: "resume" }, { parts: [] } as never)
-  goal = store.get(sessionID)!
-  assert.equal(goal.status, "active")
+  for (let expectedCalls = 2; expectedCalls <= 9; expectedCalls += 1) {
+    goal = { ...store.get(sessionID)!, nextRetryAt: Date.now() - 1 }
+    writeFileSync(join(projectDir, ".opencode/goal", `${sessionID}.json`), JSON.stringify(goal))
+    await event({ event: { type: "session.idle", properties: { sessionID } } })
+    goal = store.get(sessionID)!
+    assert.equal(calls, expectedCalls)
+    assert.equal(goal.status, "active")
+    if (expectedCalls <= 8) {
+      assert.equal(goal.turnCount, 0)
+      assert.ok(goal.nextRetryAt! > Date.now())
+      assert.ok(goal.nextRetryAt! - goal.lastErrorAt! <= RETRY_MAX_DELAY_MS)
+      if (expectedCalls >= 6) assert.equal(goal.nextRetryAt! - goal.lastErrorAt!, RETRY_MAX_DELAY_MS)
+    }
+  }
   assert.equal(goal.consecutiveFailures, 0)
   assert.equal(goal.nextRetryAt, null)
-  await event({ event: { type: "session.idle", properties: { sessionID } } })
-  assert.equal(calls, 3)
   assert.equal(store.get(sessionID)!.turnCount, 1)
   await hooks.dispose?.()
 })
@@ -397,7 +465,7 @@ test("in-flight, busy, and compaction states suppress duplicate continuations", 
   await hooks.dispose?.()
 })
 
-test("aborted continuation uses bounded retry and can be resumed", async () => {
+test("externally aborted continuation keeps retrying without stopping the goal", async () => {
   const projectDir = mkdtempSync(join(tmpdir(), "opencode-goal-aborted-"))
   let calls = 0
   const aborted = { name: "MessageAbortedError", data: { message: "Aborted" } }
@@ -426,21 +494,16 @@ test("aborted continuation uses bounded retry and can be resumed", async () => {
   assert.equal(goal.lastErrorKind, "aborted")
   assert.ok(goal.nextRetryAt! >= Date.now())
 
-  goal = { ...goal, nextRetryAt: Date.now() - 1 }
-  writeFileSync(join(projectDir, ".opencode/goal", `${sessionID}.json`), JSON.stringify(goal))
-  await event({ event: { type: "session.idle", properties: { sessionID } } })
-  goal = store.get(sessionID)!
-  assert.equal(calls, 2)
-  assert.equal(goal.status, "waiting")
-  assert.equal(goal.nextRetryAt, null)
-
-  await before({ command: "goal", sessionID, arguments: "resume" }, { parts: [] } as never)
-  await event({ event: { type: "session.idle", properties: { sessionID } } })
-  goal = store.get(sessionID)!
-  assert.equal(calls, 3)
-  assert.equal(goal.status, "active")
-  assert.equal(goal.lastErrorKind, "aborted")
-  assert.ok(goal.nextRetryAt! >= Date.now())
+  for (let expectedCalls = 2; expectedCalls <= 4; expectedCalls += 1) {
+    goal = { ...goal, nextRetryAt: Date.now() - 1 }
+    writeFileSync(join(projectDir, ".opencode/goal", `${sessionID}.json`), JSON.stringify(goal))
+    await event({ event: { type: "session.idle", properties: { sessionID } } })
+    goal = store.get(sessionID)!
+    assert.equal(calls, expectedCalls)
+    assert.equal(goal.status, "active")
+    assert.equal(goal.lastErrorKind, "aborted")
+    assert.ok(goal.nextRetryAt! >= Date.now())
+  }
   await hooks.dispose?.()
 })
 

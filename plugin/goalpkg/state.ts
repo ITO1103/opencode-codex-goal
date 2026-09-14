@@ -14,8 +14,6 @@ export type GoalErrorKind =
   | "no_progress"
   | "unknown"
 
-export const MAX_CONSECUTIVE_FAILURES = 3
-export const MAX_NO_PROGRESS_FAILURES = 2
 export const RETRY_BASE_DELAY_MS = 1_000
 export const RETRY_MAX_DELAY_MS = 30_000
 
@@ -235,29 +233,16 @@ export class GoalStore {
     if (!goal || goal.status !== "active") return undefined
 
     const now = Date.now()
-    const sameFailureWithoutProgress =
-      goal.lastErrorKind === kind &&
-      goal.lastErrorMessage === message &&
-      goal.lastErrorAt !== null &&
-      (goal.lastProgressAt === null || goal.lastProgressAt <= goal.lastErrorAt)
     goal.consecutiveFailures += 1
     goal.lastErrorKind = kind
     goal.lastErrorMessage = message.slice(0, 1_000)
     goal.lastErrorAt = now
 
-    if (kind === "model_turn") {
-      goal.status = "blocked"
-      goal.nextRetryAt = null
-      goal.waitingForCompaction = false
-    } else if (kind === "context_overflow") {
+    if (kind === "context_overflow") {
       goal.status = "waiting"
       goal.nextRetryAt = null
       goal.waitingForCompaction = true
-    } else if (
-      !retryable ||
-      goal.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES ||
-      (sameFailureWithoutProgress && goal.consecutiveFailures >= MAX_NO_PROGRESS_FAILURES)
-    ) {
+    } else if (!retryable) {
       goal.status = "waiting"
       goal.nextRetryAt = null
       goal.waitingForCompaction = false
