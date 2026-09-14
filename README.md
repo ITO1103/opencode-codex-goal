@@ -11,7 +11,7 @@ OpenCode 1.x向けの，OpenAI Codex CLIのGoal continuationの考え方を移�
 - Goal stateは現在のプロジェクトの `.opencode/goal/<sessionID>.json` に保存されます．global pluginとして導入しても，clone先の `~/.config/opencode/opencode-codex-goal/goal/` には保存されません．
 - 成功した継続turn数に固定上限はありません．Goalが `complete`，`blocked`，`paused`，`waiting`，`cleared` になるまで継続します．transport/API/abort障害の失敗retryだけはbackoffと連続失敗上限で停止します．
 - `goal_checkpoint`，`goal_complete`，`goal_blocked` はモデル側に提供され，pause/resume/clearはユーザーの `/goal` 操作です．
-- 同じツールに同じ引数を3回連続で渡す無進捗ループは，`waiting` へ移行して現在のsessionをabortします．`lastErrorKind` は `no_progress` になります．
+- 同じツールに同じ引数を3回連続で渡す無進捗ループは，まず現在のsessionをabortして回復用プロンプトを1回送り，read・list・bash・testなど別の検証手段を要求します．回復後も同じ呼び出しを続ける場合は，その呼び出しを拒否し，最終的に`waiting`へ移行します．`lastErrorKind` は `no_progress` になります．
 - objectiveとcompletion/blocked auditはsystem promptへ注入します．Qwen系などsingle-system-messageを要求するモデルでは，既存の先頭system messageへmergeします．
 - `/goal` commandの実行時は内部のcontinuation templateを画面へ展開せず，簡潔な表示だけを返します．
 
@@ -63,7 +63,7 @@ symlinkはclone先を指しているため，OpenCodeを再起動すれば更新
 
 Goalを設定するとactive stateがsession IDごとに保存されます．通常のturnがidleになると，Pluginは同じsessionへ短いcontinuation messageを送り，system promptにはobjectiveとaudit templateを再注入します．同じsessionでpromptがin-flightの間，sessionがbusy/retryの間，またはcompaction中は重複したpromptを送信しません．モデルが実際の状態を確認して全要件を満たしたと判断したとき `goal_complete` を呼び，厳密なblocked auditを満たしてユーザー入力などなしには進められないとき `goal_blocked` を呼びます．意味のある中間成果は `goal_checkpoint` で記録できます．
 
-自動継続の成功turn数はuncappedです．一方，SSE read timeout，ECONNRESET，abortなどのretryable errorは指数backoffで通常最大3回の連続失敗まで再試行し，超過すると `waiting` へ移ります．同じエラーが進捗なしで続く場合は2回で早期停止します．同じツール呼び出しが同じ引数で3回連続した場合も，無進捗ループとして `waiting` に移り，現在のsessionをabortします．認証エラー，非retryable API error，未知の障害は `waiting` に移します．context overflowはcompaction完了まで `waiting` に保持します．明示的に停止する場合は `/goal pause` または `/goal clear` を使用してください．`waiting` からは `/goal resume` でretryカウンタと待機状態をリセットして再開できます．`blocked` はgoal自体の外部入力待ち，`paused` はユーザー停止，`waiting` はLLM/API障害または無進捗ループによる自動停止です．
+自動継続の成功turn数はuncappedです．一方，SSE read timeout，ECONNRESET，abortなどのretryable errorは指数backoffで通常最大3回の連続失敗まで再試行し，超過すると `waiting` へ移ります．同じエラーが進捗なしで続く場合は2回で早期停止します．同じツール呼び出しが同じ引数で3回連続した場合は，無進捗ループとして現在のsessionをabortし，回復用プロンプトを1回実行します．回復用プロンプト中に同じ呼び出しを行った場合はpluginが拒否し，別のツール・引数を要求します．回復に失敗した場合だけ`waiting`へ移ります．認証エラー，非retryable API error，未知の障害は `waiting` に移します．context overflowはcompaction完了まで `waiting` に保持します．明示的に停止する場合は `/goal pause` または `/goal clear` を使用してください．`waiting` からは `/goal resume` でretryカウンタと待機状態をリセットして再開できます．`blocked` はgoal自体の外部入力待ち，`paused` はユーザー停止，`waiting` はLLM/API障害または最終的な無進捗ループによる自動停止です．
 
 ## 開発と確認
 

@@ -3,7 +3,7 @@ import type { TextPartInput } from "@opencode-ai/sdk"
 import { join } from "node:path"
 import { GoalStore, type Goal, type GoalErrorKind } from "./state.ts"
 import { parseGoalArgs } from "./verbs.ts"
-import { renderGoalSystem, CONTINUE_NUDGE } from "./prompt.ts"
+import { renderGoalSystem, renderNoProgressRecovery, CONTINUE_NUDGE } from "./prompt.ts"
 import { makeGoalTools } from "./tools.ts"
 
 const MODEL_TURN_ERROR_NAMES = new Set(["UnknownError", "MessageOutputLengthError"])
@@ -16,6 +16,7 @@ const CONTEXT_MSG_RE =
   /context.{0,30}(overflow|length|window|limit)|too many tokens|maximum context|prompt.{0,20}(too long|token)|token.{0,20}(limit|exceed)|exceed.{0,20}(context|token)/i
 
 export const MAX_IDENTICAL_TOOL_CALLS = 3
+export const MAX_NO_PROGRESS_RECOVERY_ATTEMPTS = 1
 
 function stableSerialize(value: unknown): string {
   if (value === null) return "null"
@@ -133,6 +134,8 @@ type RuntimeSessionStatus = "idle" | "retry" | "busy"
 type ContinuationAttempt = { handled: boolean; idleObserved: boolean }
 type RetryTimer = ReturnType<typeof setTimeout>
 type RepeatedToolCall = { signature: string; count: number }
+type RecoveryRequest = { tool: string; attempt: number }
+type RecoveryGuard = { signature: string; tool: string; blockedCount: number }
 
 export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
   const store = new GoalStore(resolveStateDir(input))
@@ -143,6 +146,10 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
   const retryTimers = new Map<string, RetryTimer>()
   const recentErrors = new Map<string, { kind: GoalErrorKind; message: string; at: number }>()
   const repeatedToolCalls = new Map<string, RepeatedToolCall>()
+  const pendingRecoveries = new Map<string, RecoveryRequest>()
+  const recoveryAttempts = new Map<string, number>()
+  const recoveryGuards = new Map<string, RecoveryGuard>()
+  const recoveryAborts = new Map<string, Promise<void>>()
 
   function clearRetryTimer(sessionID: string): void {
     const timer = retryTimers.get(sessionID)
@@ -158,6 +165,13 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
 
   function resetRepeatedToolCall(sessionID: string): void {
     repeatedToolCalls.delete(sessionID)
+  }
+
+  function resetRecovery(sessionID: string): void {
+    pendingRecoveries.delete(sessionID)
+    recoveryAttempts.delete(sessionID)
+    recoveryGuards.delete(sessionID)
+    recoveryAborts.delete(sessionID)
   }
 
   function observeToolCall(sessionID: string, tool: string, args: unknown): number {
@@ -179,6 +193,9 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
 
   async function stopForNoProgress(sessionID: string, tool: string, count: number): Promise<void> {
     invalidateAttempt(sessionID)
+    pendingRecoveries.delete(sessionID)
+    recoveryAttempts.delete(sessionID)
+    recoveryGuards.delete(sessionID)
     const updated = store.recordFailure(
       sessionID,
       "no_progress",
@@ -188,6 +205,30 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
     if (!updated || updated.status !== "waiting") return
     clearRetryTimer(sessionID)
     await abortSession(sessionID)
+  }
+
+  async function startNoProgressRecovery(sessionID: string, tool: string, args: unknown, count: number): Promise<void> {
+    invalidateAttempt(sessionID)
+    const previousAttempts = recoveryAttempts.get(sessionID) ?? 0
+    if (previousAttempts >= MAX_NO_PROGRESS_RECOVERY_ATTEMPTS) {
+      await stopForNoProgress(sessionID, tool, count)
+      return
+    }
+
+    const attempt = previousAttempts + 1
+    const signature = toolCallSignature(tool, args)
+    const message = `Identical tool call repeated ${count} times: ${tool}`
+    const updated = store.recordNoProgressRecovery(sessionID, message)
+    if (!updated || updated.status !== "active") return
+
+    recoveryAttempts.set(sessionID, attempt)
+    recoveryGuards.set(sessionID, { signature, tool, blockedCount: 0 })
+    pendingRecoveries.set(sessionID, { tool, attempt })
+    resetRepeatedToolCall(sessionID)
+    const abort = abortSession(sessionID)
+    recoveryAborts.set(sessionID, abort)
+    await abort
+    if (recoveryAborts.get(sessionID) === abort) recoveryAborts.delete(sessionID)
   }
 
   function scheduleRetry(sessionID: string, nextRetryAt: number): void {
@@ -221,8 +262,8 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
     scheduleRetry(sessionID, updated.nextRetryAt)
   }
 
-  async function runContinuation(sessionID: string): Promise<void> {
-    if (inFlight.has(sessionID) || compactingSessions.has(sessionID)) return
+  async function runPrompt(sessionID: string, promptText: string): Promise<void> {
+    if (inFlight.has(sessionID)) return
 
     const goal = store.get(sessionID)
     if (!goal || goal.status !== "active") return
@@ -243,7 +284,7 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
       try {
         response = await client.session.prompt({
           path: { id: sessionID },
-          body: { parts: [{ type: "text", text: CONTINUE_NUDGE }] },
+          body: { parts: [{ type: "text", text: promptText }] },
         })
       } catch (error) {
         handleError(sessionID, error, attempt)
@@ -270,9 +311,63 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
       // A storage or lifecycle error must not break the host event loop.
     } finally {
       inFlight.delete(sessionID)
+      if (pendingRecoveries.has(sessionID)) {
+        queueMicrotask(() => void runRecovery(sessionID))
+      }
     }
 
     if (continueAfterSuccess) queueMicrotask(() => void runContinuation(sessionID))
+  }
+
+  async function runRecovery(sessionID: string): Promise<void> {
+    if (inFlight.has(sessionID) || compactingSessions.has(sessionID)) return
+
+    const recovery = pendingRecoveries.get(sessionID)
+    if (!recovery) return
+
+    const abort = recoveryAborts.get(sessionID)
+    if (abort) {
+      await abort
+      if (pendingRecoveries.has(sessionID)) queueMicrotask(() => void runRecovery(sessionID))
+      return
+    }
+
+    const runtimeStatus = sessionStatuses.get(sessionID)
+    if (runtimeStatus === "busy" || runtimeStatus === "retry") return
+
+    const goal = store.get(sessionID)
+    if (!goal || goal.status !== "active") {
+      pendingRecoveries.delete(sessionID)
+      return
+    }
+
+    pendingRecoveries.delete(sessionID)
+    await runPrompt(
+      sessionID,
+      renderNoProgressRecovery(recovery.tool, recovery.attempt, MAX_NO_PROGRESS_RECOVERY_ATTEMPTS),
+    )
+  }
+
+  async function runContinuation(sessionID: string): Promise<void> {
+    if (pendingRecoveries.has(sessionID)) {
+      await runRecovery(sessionID)
+      return
+    }
+
+    if (inFlight.has(sessionID) || compactingSessions.has(sessionID)) return
+
+    const goal = store.get(sessionID)
+    if (!goal || goal.status !== "active") return
+
+    const runtimeStatus = sessionStatuses.get(sessionID)
+    if (runtimeStatus === "busy" || runtimeStatus === "retry") return
+
+    if (goal.nextRetryAt !== null && goal.nextRetryAt > Date.now()) {
+      scheduleRetry(sessionID, goal.nextRetryAt)
+      return
+    }
+
+    await runPrompt(sessionID, CONTINUE_NUDGE)
   }
 
   return {
@@ -292,6 +387,7 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
           invalidateAttempt(sessionID)
           clearRetryTimer(sessionID)
           resetRepeatedToolCall(sessionID)
+          resetRecovery(sessionID)
           store.set(sessionID, action.objective)
           setParts(output, CONTINUE_NUDGE)
           return
@@ -303,6 +399,7 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
           invalidateAttempt(sessionID)
           clearRetryTimer(sessionID)
           resetRepeatedToolCall(sessionID)
+          resetRecovery(sessionID)
           store.setStatus(sessionID, "paused")
           setParts(
             output,
@@ -319,6 +416,7 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
           invalidateAttempt(sessionID)
           clearRetryTimer(sessionID)
           resetRepeatedToolCall(sessionID)
+          resetRecovery(sessionID)
           store.resume(sessionID)
           setParts(
             output,
@@ -336,6 +434,7 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
           invalidateAttempt(sessionID)
           clearRetryTimer(sessionID)
           resetRepeatedToolCall(sessionID)
+          resetRecovery(sessionID)
           store.clear(sessionID)
           setParts(output, "[goal] cleared.")
           return
@@ -376,6 +475,10 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
             attempt.idleObserved = true
             return
           }
+          if (pendingRecoveries.has(event.properties.sessionID)) {
+            await runRecovery(event.properties.sessionID)
+            return
+          }
           await runContinuation(event.properties.sessionID)
           return
         }
@@ -410,19 +513,42 @@ export const GoalPlugin: Plugin = async (input): Promise<Hooks> => {
       }
     },
 
+    "tool.execute.before": async (toolInput, output) => {
+      const guard = recoveryGuards.get(toolInput.sessionID)
+      if (!guard) return
+
+      const signature = toolCallSignature(toolInput.tool, output.args)
+      if (signature !== guard.signature) {
+        return
+      }
+
+      guard.blockedCount += 1
+      if (guard.blockedCount >= MAX_IDENTICAL_TOOL_CALLS) {
+        await stopForNoProgress(toolInput.sessionID, guard.tool, guard.blockedCount)
+      }
+      throw new Error(
+        `[goal] Recovery required: refusing identical tool call ${guard.blockedCount}/${MAX_IDENTICAL_TOOL_CALLS} for ${guard.tool}. Choose a different approach.`,
+      )
+    },
+
     "tool.execute.after": async (toolInput) => {
       try {
         if (toolInput.tool === "goal_checkpoint") {
           resetRepeatedToolCall(toolInput.sessionID)
+          resetRecovery(toolInput.sessionID)
           return
         }
 
         const goal = store.get(toolInput.sessionID)
         if (!goal || goal.status !== "active") return
 
+        const recovery = recoveryGuards.get(toolInput.sessionID)
+        const signature = toolCallSignature(toolInput.tool, toolInput.args)
+        if (recovery && signature !== recovery.signature) resetRecovery(toolInput.sessionID)
+
         const count = observeToolCall(toolInput.sessionID, toolInput.tool, toolInput.args)
         if (count >= MAX_IDENTICAL_TOOL_CALLS) {
-          await stopForNoProgress(toolInput.sessionID, toolInput.tool, count)
+          await startNoProgressRecovery(toolInput.sessionID, toolInput.tool, toolInput.args, count)
           return
         }
 

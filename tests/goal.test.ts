@@ -173,15 +173,19 @@ test("Qwen-compatible system handling and model error policy are preserved", asy
   assert.match(output.system[0], /existing[\s\S]*Continue working toward the active goal\./)
 })
 
-test("identical tool calls stop the goal and abort the active session", async () => {
+test("identical tool calls trigger recovery and eventually stop", async () => {
   const projectDir = mkdtempSync(join(tmpdir(), "opencode-goal-no-progress-"))
   const aborts: unknown[] = []
+  const prompts: unknown[] = []
   const hooks = await GoalPlugin({
     directory: projectDir,
     worktree: projectDir,
     client: {
       session: {
-        prompt: async () => ({}),
+        prompt: async (value: unknown) => {
+          prompts.push(value)
+          return {}
+        },
         abort: async (value: unknown) => {
           aborts.push(value)
           return {}
@@ -190,6 +194,8 @@ test("identical tool calls stop the goal and abort the active session", async ()
     },
   } as never)
   const before = hooks["command.execute.before"]!
+  const beforeTool = hooks["tool.execute.before"]!
+  const event = hooks.event!
   const after = hooks["tool.execute.after"]!
   const store = new GoalStore(join(projectDir, ".opencode/goal"))
   const sessionID = "no-progress"
@@ -205,25 +211,63 @@ test("identical tool calls stop the goal and abort the active session", async ()
   }
 
   let goal = store.get(sessionID)!
-  assert.equal(goal.status, "waiting")
+  assert.equal(goal.status, "active")
   assert.equal(goal.lastErrorKind, "no_progress")
   assert.match(goal.lastErrorMessage ?? "", /Identical tool call repeated 3 times/)
   assert.deepEqual(aborts, [{ path: { id: sessionID } }])
 
-  await after(
-    { sessionID, tool: "acah_re_acah_re_write", callID: "call-4", args },
-    { title: "write", output: "wrote 12 characters", metadata: {} },
-  )
-  assert.equal(aborts.length, 1)
+  await event({ event: { type: "session.idle", properties: { sessionID } } })
+  assert.equal(prompts.length, 1)
+  assert.match(((prompts[0] as { body?: { parts?: Array<{ text?: string }> } }).body?.parts?.[0]?.text ?? ""), /goal recovery 1\/1/)
+  assert.equal(store.get(sessionID)?.status, "active")
 
-  await before({ command: "goal", sessionID, arguments: "resume" }, { parts: [] } as never)
-  await after(
-    { sessionID, tool: "acah_re_acah_re_write", callID: "call-resumed", args },
-    { title: "write", output: "wrote 12 characters", metadata: {} },
+  await assert.rejects(
+    () => beforeTool({ sessionID, tool: "acah_re_acah_re_write", callID: "blocked-1" }, { args } as never),
+    /Recovery required: refusing identical tool call 1\/3/,
   )
+  for (let count = 2; count <= MAX_IDENTICAL_TOOL_CALLS; count += 1) {
+    await assert.rejects(
+      () => beforeTool({ sessionID, tool: "acah_re_acah_re_write", callID: `blocked-${count}` }, { args } as never),
+      new RegExp(`Recovery required: refusing identical tool call ${count}/${MAX_IDENTICAL_TOOL_CALLS}`),
+    )
+  }
   goal = store.get(sessionID)!
-  assert.equal(goal.status, "active")
-  assert.equal(aborts.length, 1)
+  assert.equal(goal.status, "waiting")
+  assert.equal(aborts.length, 2)
+  await hooks.dispose?.()
+})
+
+test("a successful alternate tool call clears the recovery guard", async () => {
+  const projectDir = mkdtempSync(join(tmpdir(), "opencode-goal-recovery-alternate-"))
+  const hooks = await GoalPlugin({
+    directory: projectDir,
+    worktree: projectDir,
+    client: { session: { prompt: async () => ({}), abort: async () => ({}) } },
+  } as never)
+  const before = hooks["command.execute.before"]!
+  const beforeTool = hooks["tool.execute.before"]!
+  const after = hooks["tool.execute.after"]!
+  const event = hooks.event!
+  const sessionID = "recovery-alternate"
+  const writeArgs = { content: "same content", path: "/work/src/container/cpk_reader.h" }
+
+  await before({ command: "goal", sessionID, arguments: "make progress" }, { parts: [] } as never)
+  for (let count = 1; count <= MAX_IDENTICAL_TOOL_CALLS; count += 1) {
+    await after(
+      { sessionID, tool: "acah_re_acah_re_write", callID: `write-${count}`, args: writeArgs },
+      { title: "write", output: "wrote 12 characters", metadata: {} },
+    )
+  }
+  await event({ event: { type: "session.idle", properties: { sessionID } } })
+
+  const readArgs = { path: writeArgs.path }
+  await beforeTool({ sessionID, tool: "acah_re_acah_re_read", callID: "read-1" }, { args: readArgs } as never)
+  await after(
+    { sessionID, tool: "acah_re_acah_re_read", callID: "read-1", args: readArgs },
+    { title: "read", output: "verified", metadata: {} },
+  )
+  await beforeTool({ sessionID, tool: "acah_re_acah_re_write", callID: "write-after-recovery" }, { args: writeArgs } as never)
+  assert.equal(new GoalStore(join(projectDir, ".opencode/goal")).get(sessionID)?.status, "active")
   await hooks.dispose?.()
 })
 

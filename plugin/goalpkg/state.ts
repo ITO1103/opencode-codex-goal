@@ -269,6 +269,22 @@ export class GoalStore {
     return goal
   }
 
+  recordNoProgressRecovery(sessionID: string, message: string): Goal | undefined {
+    const goal = this.get(sessionID)
+    if (!goal || goal.status !== "active") return undefined
+
+    const now = Date.now()
+    goal.consecutiveFailures += 1
+    goal.lastErrorKind = "no_progress"
+    goal.lastErrorMessage = message.slice(0, 1_000)
+    goal.lastErrorAt = now
+    goal.nextRetryAt = null
+    goal.waitingForCompaction = false
+    goal.updatedAt = now
+    this.write(goal)
+    return goal
+  }
+
   recordProgress(sessionID: string, kind: string): Goal | undefined {
     const goal = this.get(sessionID)
     if (!goal || goal.status !== "active") return undefined
